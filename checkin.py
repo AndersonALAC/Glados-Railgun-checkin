@@ -172,8 +172,14 @@ class Config:
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
 
-# 两个站点的所有 API 请求固定使用 macOS User-Agent。
-MACOS_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+# 各平台合法 User-Agent（版本号无关，仅平台 token 关键）
+PLATFORM_UA = {
+    "Windows": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "macOS": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Linux": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "iPhone": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+    "Android": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+}
 
 
 class API:
@@ -189,6 +195,7 @@ class API:
         self.cookie_index: int = cookie_index
         self.verbose: bool = verbose
         self.headers: Dict[str, str] = self._get_headers()
+        self._device_ua_cache: Dict[str, str] = {}
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         # 网络抖动时自动重试（指数退避），避免误报失败
@@ -228,7 +235,7 @@ class API:
         """获取请求头"""
         return {
             "origin": f"https://{self.domain}",
-            "user-agent": MACOS_USER_AGENT,
+            "user-agent": PLATFORM_UA["Windows"],
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
@@ -248,9 +255,11 @@ class API:
         """获取完整 URL"""
         return f"https://{self.domain}{path}"
 
-    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "") -> Optional[requests.Response]:
+    def _make_request(self, url: str, method: str, data: Optional[Dict] = None, cookies: str = "", user_agent: Optional[str] = None) -> Optional[requests.Response]:
         """发送 HTTP 请求"""
         session_headers = self.headers.copy()
+        if user_agent:
+            session_headers["user-agent"] = user_agent
         session_headers["cookie"] = cookies
 
         try:
@@ -276,16 +285,28 @@ class API:
 
     @log_method
     def checkin(self, cookies: str) -> Dict[str, Union[str, CheckinStatus]]:
-        """使用固定 macOS UA 执行签到"""
+        """执行签到，含设备平台自适应重试"""
         url = self._get_full_url(self.CHECKIN_URL)
         checkin_data = self._get_checkin_data()
-        raw = self._checkin_attempt(url, checkin_data, cookies)
+
+        # 起始 UA 优先复用已学得的设备 UA，否则用会话默认 UA
+        start_ua = self._device_ua_cache.get("_last") or self.headers.get("user-agent")
+
+        raw = self._checkin_attempt(url, checkin_data, cookies, start_ua)
+
+        # 设备不匹配(code 4)时按服务端 loginDevice 切换 UA 重试一次
+        if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
+            login_device = raw.get("loginDevice")
+            recover_ua = self._device_ua_cache.get(login_device) or PLATFORM_UA.get(login_device)
+            if recover_ua and recover_ua != start_ua:
+                self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
+                raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
 
         return self._parse_checkin(raw)
 
-    def _checkin_attempt(self, url: str, data: Dict, cookies: str) -> Optional[Dict]:
+    def _checkin_attempt(self, url: str, data: Dict, cookies: str, user_agent: str) -> Optional[Dict]:
         """发起一次签到请求并返回解析后的响应体（失败返回 None）"""
-        response = self._make_request(url, "POST", data, cookies)
+        response = self._make_request(url, "POST", data, cookies, user_agent=user_agent)
         if not response:
             return None
         try:
@@ -293,6 +314,14 @@ class API:
         except ValueError:
             self._log("error", LogEmoji.ERROR, "签到响应解析失败", force=True)
             return None
+
+        # 缓存学得的设备 UA，供本次运行后续请求复用
+        if raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
+            login_device = raw.get("loginDevice")
+            if login_device in PLATFORM_UA:
+                self._device_ua_cache[login_device] = PLATFORM_UA[login_device]
+        elif raw.get("code") in (CheckinStatus.SUCCESS.value, CheckinStatus.REPEAT.value):
+            self._device_ua_cache["_last"] = user_agent
 
         return raw
 
